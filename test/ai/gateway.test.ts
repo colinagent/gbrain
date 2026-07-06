@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import {
   configureGateway,
   resetGateway,
@@ -109,6 +110,12 @@ describe('gateway.isAvailable (silent-drop regression surface)', () => {
       env: { ANTHROPIC_API_KEY: 'fake' },
     });
     expect(isAvailable('expansion')).toBe(true);
+  });
+
+  test('expansion uses a dedicated low-latency timeout', () => {
+    const source = readFileSync(new URL('../../src/core/ai/gateway.ts', import.meta.url), 'utf8');
+    expect(source).toContain("GBRAIN_AI_EXPANSION_TIMEOUT_MS', 3_000");
+    expect(source).toContain('withDefaultTimeout(undefined, AI_EXPANSION_TIMEOUT_MS)');
   });
 });
 

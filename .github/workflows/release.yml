@@ -2,7 +2,9 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+      - 'openbrain-fork-*'
 
 permissions:
   contents: write
@@ -15,9 +17,15 @@ jobs:
           - os: macos-latest
             target: bun-darwin-arm64
             artifact: gbrain-darwin-arm64
+          - os: macos-latest
+            target: bun-darwin-x64
+            artifact: gbrain-darwin-x64
           - os: ubuntu-latest
             target: bun-linux-x64
             artifact: gbrain-linux-x64
+          - os: windows-latest
+            target: bun-windows-x64
+            artifact: gbrain-windows-x64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -27,10 +35,17 @@ jobs:
       - run: bun install
       - run: bun test
       - run: bun build --compile --target=${{ matrix.target }} --outfile bin/${{ matrix.artifact }} src/cli.ts
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd bin
+          shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ matrix.artifact }}
-          path: bin/${{ matrix.artifact }}
+          path: |
+            bin/${{ matrix.artifact }}
+            bin/${{ matrix.artifact }}.sha256
 
   release:
     needs: build
@@ -44,5 +59,11 @@ jobs:
         with:
           files: |
             artifacts/gbrain-darwin-arm64/gbrain-darwin-arm64
+            artifacts/gbrain-darwin-arm64/gbrain-darwin-arm64.sha256
+            artifacts/gbrain-darwin-x64/gbrain-darwin-x64
+            artifacts/gbrain-darwin-x64/gbrain-darwin-x64.sha256
             artifacts/gbrain-linux-x64/gbrain-linux-x64
+            artifacts/gbrain-linux-x64/gbrain-linux-x64.sha256
+            artifacts/gbrain-windows-x64.exe/gbrain-windows-x64.exe
+            artifacts/gbrain-windows-x64.exe/gbrain-windows-x64.exe.sha256
           generate_release_notes: true

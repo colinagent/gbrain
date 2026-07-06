@@ -65,6 +65,7 @@ import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte } from './search/sql-ranking.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { hasCJK, escapeLikePattern } from './cjk.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -1665,6 +1666,19 @@ export class PostgresEngine implements BrainEngine {
     // not a temporal preference.
     const visibilityClause = buildVisibilityClause('p', 's');
 
+    if (hasCJK(query)) {
+      return this._searchKeywordCJK(query, {
+        limit,
+        offset,
+        innerLimit,
+        sourceFactorCase,
+        hardExcludeClause,
+        visibilityClause,
+        opts,
+        dedup: true,
+      });
+    }
+
     const rawQuery = `
       WITH ranked_chunks AS (
         SELECT
@@ -1707,6 +1721,148 @@ export class PostgresEngine implements BrainEngine {
 
     // Search-only timeout. SET LOCAL inside sql.begin() scopes the GUC
     // to the transaction so it can never leak onto a pooled connection.
+    const rows = await sql.begin(async sql => {
+      await sql`SET LOCAL statement_timeout = '8s'`;
+      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
+    });
+    return rows.map(rowToSearchResult);
+  }
+
+  /**
+   * CJK keyword fallback. Postgres `websearch_to_tsquery('english')` does not
+   * tokenize CJK, so CJK queries use an escaped ILIKE substring scan with the
+   * same source/visibility filters as the FTS branch.
+   */
+  private async _searchKeywordCJK(
+    query: string,
+    ctx: {
+      limit: number;
+      offset: number;
+      innerLimit: number;
+      sourceFactorCase: string;
+      hardExcludeClause: string;
+      visibilityClause: string;
+      opts: SearchOpts | undefined;
+      dedup: boolean;
+    },
+  ): Promise<SearchResult[]> {
+    const sql = this.sql;
+    const { limit, offset, innerLimit, sourceFactorCase, hardExcludeClause, visibilityClause, opts, dedup } = ctx;
+    if (query.length === 0) return [];
+
+    const qLike = escapeLikePattern(query);
+    const params: unknown[] = dedup
+      ? [qLike, query, innerLimit, limit, offset]
+      : [qLike, query, limit, offset];
+
+    let typeClause = '';
+    if (opts?.type) {
+      params.push(opts.type);
+      typeClause = `AND p.type = $${params.length}`;
+    }
+    let typesClause = '';
+    if (opts?.types && opts.types.length > 0) {
+      params.push(opts.types);
+      typesClause = `AND p.type = ANY($${params.length}::text[])`;
+    }
+    let excludeSlugsClause = '';
+    if (opts?.exclude_slugs?.length) {
+      params.push(opts.exclude_slugs);
+      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+    }
+    const detailClause = opts?.detail === 'low' ? `AND cc.chunk_source = 'compiled_truth'` : '';
+    let languageClause = '';
+    if (opts?.language) {
+      params.push(opts.language);
+      languageClause = `AND cc.language = $${params.length}`;
+    }
+    let symbolKindClause = '';
+    if (opts?.symbolKind) {
+      params.push(opts.symbolKind);
+      symbolKindClause = `AND cc.symbol_type = $${params.length}`;
+    }
+    let afterDateClause = '';
+    if (opts?.afterDate) {
+      params.push(opts.afterDate);
+      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+    }
+    let beforeDateClause = '';
+    if (opts?.beforeDate) {
+      params.push(opts.beforeDate);
+      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+    }
+    let sourceClause = '';
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      sourceClause = `AND p.source_id = $${params.length}`;
+    }
+
+    const scoreExpr = `
+      ((LENGTH(LOWER(cc.chunk_text)) - LENGTH(REPLACE(LOWER(cc.chunk_text), LOWER($2), ''))) / NULLIF(LENGTH($2), 0)::real
+        + COALESCE(1.0 / NULLIF(POSITION(LOWER($2) IN LOWER(cc.chunk_text)), 0)::real, 0))
+      * ${sourceFactorCase}
+    `;
+
+    const filterSql = `
+      cc.chunk_text ILIKE '%' || $1 || '%' ESCAPE '\\'
+      ${typeClause}
+      ${typesClause}
+      ${excludeSlugsClause}
+      ${detailClause}
+      ${languageClause}
+      ${symbolKindClause}
+      ${afterDateClause}
+      ${beforeDateClause}
+      ${sourceClause}
+      ${hardExcludeClause}
+      ${visibilityClause}
+    `;
+
+    const rawQuery = dedup
+      ? `
+        WITH ranked_chunks AS (
+          SELECT
+            p.slug, p.id as page_id, p.title, p.type, p.source_id,
+            p.effective_date, p.effective_date_source,
+            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+            ${scoreExpr} AS score
+          FROM content_chunks cc
+          JOIN pages p ON p.id = cc.page_id
+          JOIN sources s ON s.id = p.source_id
+          WHERE ${filterSql}
+            AND cc.modality = 'text'
+          ORDER BY score DESC
+          LIMIT $3
+        ),
+        ${buildBestPerPagePoolCte('ranked_chunks')}
+        SELECT slug, page_id, title, type, source_id,
+          effective_date, effective_date_source,
+          chunk_id, chunk_index, chunk_text, chunk_source, score,
+          false AS stale
+        FROM best_per_page
+        ORDER BY score DESC
+        LIMIT $4
+        OFFSET $5
+      `
+      : `
+        SELECT
+          p.slug, p.id as page_id, p.title, p.type, p.source_id,
+          p.effective_date, p.effective_date_source,
+          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+          ${scoreExpr} AS score,
+          false AS stale
+        FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        JOIN sources s ON s.id = p.source_id
+        WHERE ${filterSql}
+        ORDER BY score DESC
+        LIMIT $3
+        OFFSET $4
+      `;
+
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
@@ -1803,6 +1959,19 @@ export class PostgresEngine implements BrainEngine {
 
     // v0.26.5: visibility filter for searchKeywordChunks (anchor primitive).
     const visibilityClause = buildVisibilityClause('p', 's');
+
+    if (hasCJK(query)) {
+      return this._searchKeywordCJK(query, {
+        limit,
+        offset,
+        innerLimit: 0,
+        sourceFactorCase,
+        hardExcludeClause,
+        visibilityClause,
+        opts,
+        dedup: false,
+      });
+    }
 
     const rawQuery = `
       SELECT

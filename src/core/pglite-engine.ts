@@ -1644,8 +1644,7 @@ export class PGLiteEngine implements BrainEngine {
    *     chunk_text are compared as-stored).
    *   - Empty-query guard returns no results without binding SQL.
    *
-   * Postgres engine is intentionally untouched (multi-tenant deployments
-   * can install pgroonga / zhparser when needed; out of scope here).
+   * Postgres engine has a matching fallback; keep filter semantics in sync.
    */
   private async _searchKeywordCJK(
     query: string,

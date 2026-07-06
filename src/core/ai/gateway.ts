@@ -71,8 +71,10 @@ function resolveAiTimeoutMs(envVar: string, fallback: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
-/** chat / expansion / OCR — generous; only catches true hangs (non-streaming generateText). */
+/** chat / OCR — generous; only catches true hangs (non-streaming generateText). */
 const AI_CHAT_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_CHAT_TIMEOUT_MS', 300_000);
+/** query expansion is latency-sensitive and optional; skip quickly on stalls. */
+const AI_EXPANSION_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_EXPANSION_TIMEOUT_MS', 3_000);
 /** embed sub-batch (per SDK call, NOT per whole import). */
 const AI_EMBED_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_EMBED_TIMEOUT_MS', 60_000);
 /** multimodal per request. */
@@ -2178,9 +2180,9 @@ export async function expand(query: string): Promise<string[]> {
     const result = await generateObject({
       model,
       schema: ExpansionSchema,
-      // v0.42.20.0 (codex P0) — expansion had NO abortSignal; same stalled-socket
-      // class as chat. Default the chat timeout.
-      abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
+      // Expansion is best-effort and sits on the query hot path. Keep a small
+      // dedicated timeout so a slow expansion provider cannot dominate search.
+      abortSignal: withDefaultTimeout(undefined, AI_EXPANSION_TIMEOUT_MS),
       prompt: [
         'Rewrite the search query below into 3-4 different, related queries that would help find relevant documents.',
         'Return ONLY the JSON object. Do NOT include the original query in the result.',
